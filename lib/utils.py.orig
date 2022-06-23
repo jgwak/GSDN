@@ -1,0 +1,494 @@
+import random
+import logging
+import os
+import errno
+import time
+
+import numpy as np
+import torch
+
+from lib.pc_utils import colorize_pointcloud, save_point_cloud
+
+
+def elementwise_multiplication(x, y, n):
+
+  def is_iterable(z):
+    if isinstance(z, (list, tuple)):
+      return True
+    else:
+      assert type(z) is int
+      return False
+
+  if is_iterable(x) and is_iterable(y):
+    assert len(x) == len(y) == n
+
+  def convert_to_iterable(z):
+    if is_iterable(z):
+      return z
+    else:
+      return [
+          z,
+      ] * n
+
+  x = convert_to_iterable(x)
+  y = convert_to_iterable(y)
+  return [a * b for a, b in zip(x, y)]
+
+
+def load_state_with_same_shape(model, weights):
+  model_state = model.state_dict()
+  filtered_weights = {
+      k: v for k, v in weights.items() if k in model_state and v.size() == model_state[k].size()
+  }
+  logging.info("Loading weights:" + ', '.join(filtered_weights.keys()))
+  return filtered_weights
+
+
+def checkpoint(model,
+               optimizer,
+               epoch,
+               iteration,
+               config,
+               best_val=None,
+               best_val_iter=None,
+               postfix=None):
+  mkdir_p(config.log_dir)
+  if config.overwrite_weights:
+    if postfix is not None:
+      filename = f"checkpoint_{config.wrapper_type}{config.model}{postfix}.pth"
+    else:
+      filename = f"checkpoint_{config.wrapper_type}{config.model}.pth"
+  else:
+    filename = f"checkpoint_{config.wrapper_type}{config.model}_iter_{iteration}.pth"
+  checkpoint_file = config.log_dir + '/' + filename
+  state = {
+      'iteration': iteration,
+      'epoch': epoch,
+      'arch': config.model,
+      'state_dict': model.state_dict(),
+      'optimizer': optimizer.state_dict()
+  }
+  if best_val is not None:
+    state['best_val'] = best_val
+    state['best_val_iter'] = best_val_iter
+  torch.save(state, checkpoint_file)
+  logging.info(f"Checkpoint saved to {checkpoint_file}")
+  # Delete symlink if it exists
+  if os.path.exists(f'{config.log_dir}/weights.pth'):
+    os.remove(f'{config.log_dir}/weights.pth')
+  # Create symlink
+  os.system(f'cd {config.log_dir}; ln -s {filename} weights.pth')
+
+
+def feat_augmentation(data, normalized, config):
+  # color shift
+  if random.random() < 0.9:
+    tr = (torch.rand(1, 3).type_as(data) - 0.5) * \
+        config.data_aug_max_color_trans
+    if normalized:
+      tr /= 255
+    data[:, :3] += tr
+
+  # color jitter
+  if random.random() < 0.9:
+    noise = torch.randn((data.size(0), 3), dtype=data.dtype).type_as(data)
+    noise *= config.data_aug_noise_std if normalized else 255 * config.data_aug_noise_std
+    data[:, :3] += noise
+
+  # height jitter
+  if data.size(1) > 3 and random.random() < 0.9:
+    data[:, -1] += torch.randn(1, dtype=data.dtype).type_as(data)
+
+  if data.size(1) > 3 and random.random() < 0.9:
+    data[:, -1] += torch.randn((data.size(0)), dtype=data.dtype).type_as(data)
+
+  # normal jitter
+  if data.size(1) > 6 and random.random() < 0.9:
+    data[:, 3:6] += torch.randn((data.size(0), 3), dtype=data.dtype).type_as(data)
+
+
+def precision_at_one(pred, target, ignore_label=255):
+  """Computes the precision@k for the specified values of k"""
+  # batch_size = target.size(0) * target.size(1) * target.size(2)
+  pred = pred.view(1, -1)
+  target = target.view(1, -1)
+  correct = pred.eq(target)
+  correct = correct[target != ignore_label]
+  correct = correct.view(-1)
+  if correct.nelement():
+    return correct.float().sum(0).mul(100.0 / correct.size(0)).item()
+  else:
+    return float('nan')
+
+
+def fast_hist(pred, label, n):
+  k = (label >= 0) & (label < n)
+  return np.bincount(n * label[k].astype(int) + pred[k], minlength=n**2).reshape(n, n)
+
+
+def per_class_iu(hist):
+  with np.errstate(divide='ignore', invalid='ignore'):
+    return np.diag(hist) / (hist.sum(1) + hist.sum(0) - np.diag(hist))
+
+
+def convert_output2ob(output):
+  return output[:, 0], output[:, 1:]
+
+
+def convert_target2ob(target, ignore_label):
+  return (target[:, 0] != ignore_label).float(), target[:, 2:]
+
+
+def get_prediction(objectness_output, bbox_output):
+  objectness_pred = (objectness_output > 0).int()
+  return objectness_pred, bbox_output
+
+
+class WithTimer(object):
+  """Timer for with statement."""
+
+  def __init__(self, name=None):
+    self.name = name
+
+  def __enter__(self):
+    self.tstart = time.time()
+
+  def __exit__(self, type, value, traceback):
+    out_str = 'Elapsed: %s' % (time.time() - self.tstart)
+    if self.name:
+      logging.info('[{self.name}]')
+    logging.info(out_str)
+
+
+class Timer(object):
+  """A simple timer."""
+
+  def __init__(self):
+    self.total_time = 0.
+    self.calls = 0
+    self.start_time = 0.
+    self.diff = 0.
+    self.average_time = 0.
+
+  def reset(self):
+    self.total_time = 0
+    self.calls = 0
+    self.start_time = 0
+    self.diff = 0
+    self.averate_time = 0
+
+  def tic(self):
+    # using time.time instead of time.clock because time time.clock
+    # does not normalize for multithreading
+    self.start_time = time.time()
+
+  def toc(self, average=True):
+    self.diff = time.time() - self.start_time
+    self.total_time += self.diff
+    self.calls += 1
+    self.average_time = self.total_time / self.calls
+    if average:
+      return self.average_time
+    else:
+      return self.diff
+
+
+class ExpTimer(Timer):
+  """ Exponential Moving Average Timer """
+
+  def __init__(self, alpha=0.5):
+    super(ExpTimer, self).__init__()
+    self.alpha = alpha
+
+  def toc(self):
+    self.diff = time.time() - self.start_time
+    self.average_time = self.alpha * self.diff + \
+        (1 - self.alpha) * self.average_time
+    return self.average_time
+
+
+class AverageMeter(object):
+  """Computes and stores the average and current value"""
+
+  def __init__(self):
+    self.reset()
+
+  def reset(self):
+    self.val = 0
+    self.avg = 0
+    self.sum = 0
+    self.count = 0
+
+  def update(self, val, n=1):
+    self.val = val
+    self.sum += val * n
+    self.count += n
+    self.avg = self.sum / self.count
+
+
+def mkdir_p(path):
+  try:
+    os.makedirs(path)
+  except OSError as exc:
+    if exc.errno == errno.EEXIST and os.path.isdir(path):
+      pass
+    else:
+      raise
+
+
+def read_txt(path):
+  """Read txt file into lines.
+  """
+  with open(path) as f:
+    lines = f.readlines()
+  lines = [x.strip() for x in lines]
+  return lines
+
+
+def debug_on():
+  import sys
+  import pdb
+  import functools
+  import traceback
+
+  def decorator(f):
+
+    @functools.wraps(f)
+    def wrapper(*args, **kwargs):
+      try:
+        return f(*args, **kwargs)
+      except Exception:
+        info = sys.exc_info()
+        traceback.print_exception(*info)
+        pdb.post_mortem(info[2])
+
+    return wrapper
+
+  return decorator
+
+
+def permute_label(model, soutput, target, num_labels, ignore_label=255):
+  if model.NETWORK_TYPE.name == 'CLASSIFICATION':
+    perm = model.get_coords(0)[:, -1]
+    return target[perm.long()]
+  else:
+    assert (target >= num_labels).sum() == (target == ignore_label).sum()
+    clipped_target = target.clone()
+    clipped_target[target == ignore_label] = num_labels
+    permuted_target = soutput.C.permute_label(
+        clipped_target, num_labels + 1, target_pixel_dist=model.OUT_PIXEL_DIST, label_pixel_dist=1)
+    permuted_target[permuted_target == num_labels] = ignore_label
+    return permuted_target.int()
+
+
+<<<<<<< Updated upstream
+def get_prediction(output):
+  return output.max(1)[1].int()
+
+def compute_iou_3d(box1, box2):
+"""
+Args:
+  box1, box2: (6,) shape array storing (centerX, centerY, centerZ, w, h, l)
+Returns:
+  3D IOU
+"""
+  def get_overlap(left1, right1, left2, right2):
+    left_max = max(left1, left2)
+    right_min = min(right1, right2)
+    overlap = max(right_min - left_max, 0)
+    return overlap
+
+  x1, y1, z1, w1, h1, l1 = box1
+  x2, y2, z2, w2, h2, l2 = box2
+  vol1 = w1 * h1 * l1
+  vol2 = w2 * h2 * l2
+  x_inter = get_overlap(x1 - w1/2, x1 + w1/2, x2  - w2/2, x2 + w2/2)
+  y_inter = get_overlap(y1 - h1/2, y1 + h1/2, y2  - h2/2, y2 + h2/2)
+  z_inter = get_overlap(z1 - l1/2, z1 + l1/2, z2  - l2/2, z2 + l2/2)
+  inter_vol = x_inter * y_inter * z_inter
+  union_vol = vol1 + vol2 - inter_vol
+  return inter_vol / union_vol
+
+def non_maximum_suppression(bboxes, overlap_thresh):
+  """ NMS using scores. First sorts by score, then thresholds IOU by overlap_thresh
+
+  Args:
+    bboxes: [number of bboxes] x 7 array, storing (centerX, centerY, centerZ, w, h, l, score)
+    overlap_thresh: IOU threshold for NMS
+
+  Returns:
+    accepted: [filtered number of bboxes] x 7 array
+  """
+  if bboxes.size == 0:
+    return bboxes
+  num_bboxes = bboxes.shape[0]
+  bboxes_sorted = bboxes[bboxes[:, -1].argsort()[::-1]]  #sort bboxes based on descending scores (last column)
+  accepted = [bboxes_sorted[0, :]]
+  for i in range(1, num_bboxes):
+    non_overlapping = True
+    for box in accepted:
+      iou = compute_iou_3d(bboxes_sorted[i][:-1], box[:-1])
+      if iou > overlap_thresh:
+        non_overlapping = False
+        break
+    if non_overlapping:
+      accepted.append(bboxes_sorted[i, :])
+  accepted = np.vstack(accepted)
+  return accepted
+
+def get_bboxes_nms(coords, model_output, NMS_thresh):
+  """ Takes in output of detection and produces predicted bboxes after NMS
+
+  Args:
+    coords: N x 3 array storing x,y,z of each point
+    model_output: N x (dx, dy, dz, w, h, l, objectness score) array
+    NMS_thresh: 3D IOU threshold used in NMS
+
+  Returns:
+    bboxes_nms: [number of bboxes] x 7 array, storing (centerX, centerY, centerZ, w, h, l, objectness)
+      The returned bounding boxes are filtered using non maximum supression
+  """
+  coords = coords[model_output[:,-1] > 0.5] # filter out points with objectness < 0.5
+  model_output = model_output[model_output[:,-1] > 0.5] # filter out points with objectness < 0.5
+  predicted_dims = model_output[:, 3:-1]
+  predicted_objectness = model_output[:, -1]
+  predicted_centers = model_output[:, :3] + coords
+  predicted_centers_floor = np.floor(predicted_centers)
+  unique_centers, inverse_coords = np.unique(predicted_centers_floor, axis=0, return_inverse=True)
+  num_bboxes = unique_centers.shape[0]
+  bboxes = np.zeros((num_bboxes, 7)) # (centerX, centerY, centerZ, w, h, l, objectness)
+  for i in range(num_bboxes):
+    center = np.mean(predicted_centers[inverse_coords == i], axis=0)
+    bb_dims = np.mean(predicted_dims[inverse_coords == i], axis=0) #mean of voting dims
+
+    xmin, xmax = (center[0] - bb_dims[0]/2), (center[0] + bb_dims[0]/2)
+    ymin, ymax = (center[1] - bb_dims[1]/2), (center[1] + bb_dims[1]/2)
+    zmin, zmax = (center[2] - bb_dims[2]/2), (center[2] + bb_dims[2]/2)
+    mask_x = (coords[:, 0] >= xmin) & (coords[:, 0] <= xmax)
+    mask_y = (coords[:, 1] >= ymin) & (coords[:, 1] <= ymax)
+    mask_z = (coords[:, 2] >= zmin) & (coords[:, 2] <= zmax)
+    bbox_mask = (mask_x & mask_y & mask_z)
+    objectness = np.mean(predicted_objectness[bbox_mask], axis=0)  #mean objectness inside bbox
+    objectness = np.array([objectness])
+    bboxes[i] = np.concatenate((center, bb_dims, objectness))
+  bboxes_nms = non_maximum_suppression(bboxes, NMS_thresh)
+  return bboxes_nms
+
+=======
+>>>>>>> Stashed changes
+def count_parameters(model):
+  return sum(p.numel() for p in model.parameters() if p.requires_grad)
+
+
+def get_torch_device(is_cuda):
+  return torch.device('cuda' if is_cuda else 'cpu')
+
+
+class HashTimeBatch(object):
+
+  def __init__(self, prime=5279):
+    self.prime = prime
+
+  def __call__(self, time, batch):
+    return self.hash(time, batch)
+
+  def hash(self, time, batch):
+    return self.prime * batch + time
+
+  def dehash(self, key):
+    time = key % self.prime
+    batch = key / self.prime
+    return time, batch
+
+
+def save_predictions(coords, upsampled_pred, transformation, coord_min, dataset, config, iteration,
+                     save_pred_dir):
+  """Save prediction results in original pointcloud scale."""
+  assert transformation is not None, 'Need transformation matrix.'
+  iter_size = coords[:, -1].max() + 1  # Normally batch_size, may be smaller at the end.
+  if dataset.IS_TEMPORAL:  # Iterate over temporal dilation.
+    iter_size *= config.temporal_numseq
+  for i in range(iter_size):
+    # Get current pointcloud filtering mask.
+    if dataset.IS_TEMPORAL:
+      j = i % config.temporal_numseq
+      i = i // config.temporal_numseq
+    batch_mask = coords[:, -1].numpy() == i
+    if dataset.IS_TEMPORAL:
+      batch_mask = np.logical_and(batch_mask, coords[:, -2].numpy() == j)
+    # Calculate original coordinates.
+    coords_original = coords[:, :3].numpy()[batch_mask] + coord_min[:3].numpy() + 0.5
+    # Undo voxelizer transformation.
+    curr_transformation = transformation[i, :16].numpy().reshape(4, 4)
+    xyz = np.hstack((coords_original, np.ones((batch_mask.sum(), 1))))
+    orig_coords = (np.linalg.inv(curr_transformation) @ xyz.T).T
+    orig_pred = upsampled_pred[batch_mask]
+    # Undo ignore label masking to fit original dataset label.
+    decode_label_map = {}
+    for k, v in dataset.label_map.items():
+      decode_label_map[v] = k
+    orig_pred = np.array([decode_label_map[x] for x in orig_pred], dtype=np.int)
+    # Determine full path of the destination.
+    full_pred = np.hstack((orig_coords[:, :3], np.expand_dims(orig_pred, 1)))
+    filename = 'pred_%04d_%02d.npy' % (iteration, i)
+    if dataset.IS_TEMPORAL:
+      filename = 'pred_%04d_%02d_%02d.npy' % (iteration, i, j)
+    # Save final prediction as npy format.
+    np.save(os.path.join(save_pred_dir, filename), full_pred)
+
+
+def visualize_results(coords, input, target, upsampled_pred, config, iteration):
+  # Get filter for valid predictions in the first batch.
+  target_batch = coords[:, 3].numpy() == 0
+  input_xyz = coords[:, :3].numpy()
+  target_valid = target.numpy() != 255
+  target_pred = np.logical_and(target_batch, target_valid)
+  target_nonpred = np.logical_and(target_batch, ~target_valid)
+  ptc_nonpred = np.hstack((input_xyz[target_nonpred], np.zeros((np.sum(target_nonpred), 3))))
+  # Unwrap file index if tested with rotation.
+  file_iter = iteration
+  if config.test_rotation >= 1:
+    file_iter = iteration // config.test_rotation
+  # Create directory to save visualization results.
+  os.makedirs(config.visualize_path, exist_ok=True)
+  # Label visualization in RGB.
+  xyzlabel = colorize_pointcloud(input_xyz[target_pred], upsampled_pred[target_pred])
+  xyzlabel = np.vstack((xyzlabel, ptc_nonpred))
+  filename = '_'.join([config.dataset, config.model, 'pred', '%04d.ply' % file_iter])
+  save_point_cloud(xyzlabel, os.path.join(config.visualize_path, filename), verbose=False)
+  # RGB input values visualization.
+  xyzrgb = np.hstack((input_xyz[target_batch], input[:, :3].cpu().numpy()[target_batch]))
+  filename = '_'.join([config.dataset, config.model, 'rgb', '%04d.ply' % file_iter])
+  save_point_cloud(xyzrgb, os.path.join(config.visualize_path, filename), verbose=False)
+  # Ground-truth visualization in RGB.
+  xyzgt = colorize_pointcloud(input_xyz[target_pred], target.numpy()[target_pred])
+  xyzgt = np.vstack((xyzgt, ptc_nonpred))
+  filename = '_'.join([config.dataset, config.model, 'gt', '%04d.ply' % file_iter])
+  save_point_cloud(xyzgt, os.path.join(config.visualize_path, filename), verbose=False)
+
+
+def evaluate_temporal_average(output, coords):
+  """Take average of output across temporal dimension for the same 3D coordinates."""
+  # Take average independently for each batch.
+  for i in range(coords[:, -1].max().item() + 1):
+    # Mask batch data.
+    batch_mask = coords[:, -1] == i
+    batch_coords = coords[batch_mask, :3].numpy()
+    batch_temporal = coords[batch_mask, -2].numpy()
+    assert batch_coords.min() >= 0
+    # Get unique coordinates across 3D coordinates.
+    ravel_idx = np.ravel_multi_index(batch_coords.T, batch_coords.max(0) + 1)
+    _, temporal_idx = np.unique(ravel_idx, return_inverse=True)
+    # Unravel output features across temporal dimension.
+    num_class = output.shape[1]
+    output_temporal = np.empty((temporal_idx.max() + 1, batch_temporal.max() + 1, num_class))
+    output_temporal[:] = np.nan
+    temporal_ravel_idx = np.ravel_multi_index(
+        np.vstack((temporal_idx, batch_temporal)), output_temporal.shape[:2])
+    output_temporal.reshape(-1, num_class)[temporal_ravel_idx] = output[batch_mask].cpu().numpy()
+    # Take average across the temporal dimension.
+    output_temporal = np.nanmean(output_temporal, 1)
+    output_temporal = np.take(output_temporal, temporal_idx, axis=0)
+    assert not np.any(np.isnan(output_temporal))
+    # Assign averaged values back to the output.
+    output[batch_mask] = torch.from_numpy(output_temporal).to(output)

@@ -1,6 +1,13 @@
 # Generative Sparse Detection Networks for 3D Single-shot Object Detection
 
-This is a placeholder repository for "Generative Sparse Detection Networks for 3D Single-shot Object Detection", ECCV 2020 Spotlight.
+This is a repository for "Generative Sparse Detection Networks for 3D Single-shot Object Detection", ECCV 2020 Spotlight.
+
+## Installation
+
+```
+pip install -r requirements.txt
+python setup.py install
+```
 
 ## Links
 
@@ -13,6 +20,7 @@ This is a placeholder repository for "Generative Sparse Detection Networks for 3
 *   [Bibtex](https://jgwak.com/bibtex/gwak2020generative.bib)
 
 ## Abstract
+
 
 3D object detection has been widely studied due to its potential applicability to many promising areas such as robotics and augmented reality. Yet, the sparse nature of the 3D data poses unique challenges to this task. Most notably, the observable surface of the 3D point clouds is disjoint from the center of the instance to ground the bounding box prediction on. To this end, we propose Generative Sparse Detection Network (GSDN), a fully-convolutional single-shot sparse detection network that efficiently generates the support for object proposals. The key component of our model is a generative sparse tensor decoder, which uses a series of transposed convolutions and pruning layers to expand the support of sparse tensors while discarding unlikely object centers to maintain minimal runtime and memory footprint. GSDN can process unprecedentedly large-scale inputs with a single fully-convolutional feed-forward pass, thus does not require the heuristic post-processing stage that stitches results from sliding windows as other previous methods have. We validate our approach on three 3D indoor datasets including the large-scale 3D indoor reconstruction dataset where our method outperforms the state-of-the-art methods by a relative improvement of 7.14% while being 3.78 times faster than the best prior work.
 
